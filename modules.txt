@@ -1,0 +1,6 @@
+# github link example
+https://github.com/example/example-module/blob/master/module.json
+https://github.com/example/example-module/releases/download/LATEST/module.json
+
+# dropbox link example
+https://www.dropbox.com/scl/fi/whatever/module.json?rlkey=somekey&dl=1
