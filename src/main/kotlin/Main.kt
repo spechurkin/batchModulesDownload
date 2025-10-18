@@ -13,7 +13,7 @@ import proj.dnd.ModuleManager.unpackAll
  *
  * The file path can be passed as a command-line argument:
  * ```
- * $ kotlin MainKt modules.txt
+ * java -jar .\batchModulesDownload.jar modules.txt
  * ```
  * If no argument is provided, it defaults to `modules.txt` in the working directory.
  *
