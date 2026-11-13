@@ -1,360 +1,255 @@
 package proj.dnd
 
 import com.google.gson.GsonBuilder
-import com.google.gson.JsonSyntaxException
-import kotlinx.coroutines.*
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import proj.dnd.ModuleManager.downloadAll
 import java.io.File
-import java.io.FileOutputStream
-import java.util.zip.ZipInputStream
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import java.util.zip.CRC32
+import java.util.zip.ZipFile
 
-/**
- * Manages discovery, caching, downloading, and unpacking of remote modules for Foundry-like systems.
- *
- * This object automates retrieval of remote `module.json` manifests and their corresponding archives.
- * It supports multiple remote providers (Dropbox, GitHub, Gist) through URL normalization, local JSON
- * caching, concurrent downloading, and controlled unpacking.
- *
- * ### Responsibilities
- * - Normalizes URLs from GitHub, Dropbox, and Gist to direct download endpoints.
- * - Downloads and caches `module.json` definitions to avoid redundant network calls.
- * - Downloads corresponding ZIP archives and unpacks them into the `downloads/` directory.
- * - Handles concurrent downloads and unpacks using Kotlin coroutines and semaphores.
- * - Automatically retries failed HTTP connections through OkHttp configuration.
- *
- * ### Thread safety
- * All operations are coroutine-safe. Downloading and unpacking are executed concurrently but
- * limited by semaphores to prevent I/O saturation.
- *
- * @author spechurkin
- * @version 1.0
- **/
+/** Downloads modules in the current directory and extracts them using bounded I/O workers. */
 object ModuleManager {
+    private const val DOWNLOAD_WORKERS = 5
+    private const val UNPACK_WORKERS = 5
     private val client = OkHttpClient.Builder()
-        .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-        .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
+        .callTimeout(5, TimeUnit.MINUTES)
         .retryOnConnectionFailure(true)
         .build()
-
     private val gson = GsonBuilder().serializeNulls().create()
-    private val cacheDir = File("cache").apply { mkdirs() }
+    private val cacheDir = File("cache")
     private val downloadDir = File(".")
 
-    /**
-     * Loads and parses a list of URLs from a plain text file.
-     *
-     * Each non-empty, non-comment line is treated as a valid URL.
-     * Comment lines (starting with `#`) are ignored.
-     *
-     * @param filePath Path to the text file containing one URL per line.
-     * @return A list of normalized, non-empty URLs. If the file does not exist, returns an empty list.
-     */
     fun loadUrlsFromFile(filePath: String): List<String> {
         val file = File(filePath)
         if (!file.exists()) {
             println("⚠️ File not found: ${file.absolutePath}")
             return emptyList()
         }
-
-        return file.readLines()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() && !it.startsWith("#") }
+        return file.readLines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
     }
 
-    /**
-     * Normalizes known remote URLs to direct download links.
-     *
-     * Handles the following cases:
-     * - Converts `dropbox.com` sharing links to `dl.dropboxusercontent.com`.
-     * - Converts `github.com/.../blob/...` URLs to `raw.githubusercontent.com`.
-     * - Converts `gist.github.com` to `gist.githubusercontent.com/raw`.
-     *
-     * @param rawUrl The original user-provided URL.
-     * @return A normalized, direct-download-ready URL.
-     */
     private fun normalizeUrl(rawUrl: String): String {
         var url = rawUrl.trim()
-
-        // === Dropbox ===
         if (url.contains("dropbox.com")) {
-            url = url
-                .replace(Regex("https?://(www\\.)?dropbox\\.com"), "https://dl.dropboxusercontent.com")
+            url = url.replace(Regex("https?://(www\\.)?dropbox\\.com"), "https://dl.dropboxusercontent.com")
                 .replace(Regex("[?&](dl|raw)=\\d"), "")
         }
+        return when {
+            url.contains("github.com") && url.contains("/blob/") -> url.replace(
+                Regex("https?://github\\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)"),
+                "https://raw.githubusercontent.com/$1/$2/$3/$4"
+            )
 
-        // === GitHub ===
-        when {
-            // repo/blob → raw.githubusercontent
-            url.contains("github.com") && url.contains("/blob/") -> {
-                url = url.replace(
-                    Regex("https?://github\\.com/([^/]+)/([^/]+)/blob/([^/]+)/(.*)"),
-                    "https://raw.githubusercontent.com/$1/$2/$3/$4"
-                )
-            }
+            url.contains("gist.github.com") -> url.replace(
+                Regex("https?://gist\\.github\\.com/([^/]+)/([a-f0-9]+)"),
+                "https://gist.githubusercontent.com/$1/$2/raw"
+            )
 
-            // gist.github.com → gist.githubusercontent.com/raw
-            url.contains("gist.github.com") -> {
-                url = url.replace(
-                    Regex("https?://gist\\.github\\.com/([^/]+)/([a-f0-9]+)"),
-                    "https://gist.githubusercontent.com/$1/$2/raw"
-                )
-            }
+            else -> url
         }
-
-        return url
     }
 
-    /**
-     * Produces a `File` instance for caching the downloaded `module.json` associated with [url].
-     *
-     * Cache filename is derived from the URL hash to avoid filesystem-unfriendly characters.
-     * Cached files are stored under the `cache/` directory.
-     *
-     * This method is private because cache layout and lifecycle are internal implementation details.
-     *
-     * @param url The remote URL of the module manifest.
-     * @return A [File] pointing to the cached JSON location for the given URL.
-     */
-    private fun cacheFile(url: String): File =
-        File(cacheDir, url.hashCode().toString() + ".json")
+    private fun cacheFile(url: String): File = File(cacheDir, "${url.hashCode()}.json")
 
-    /**
-     * Downloads a file from a remote URL and saves it locally.
-     *
-     * @param url Remote file URL.
-     * @param output Target file location on disk.
-     * @throws IllegalStateException if the download fails.
-     */
+    private fun move(source: File, destination: File) {
+        retryAccessDenied {
+            try {
+                Files.move(source.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE)
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(source.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+        }
+    }
+
     private fun downloadFile(url: String, output: File) {
-        val request = Request.Builder().url(url).build()
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("Downloading error: ${response.code}")
-            response.body?.byteStream()?.use { input ->
-                FileOutputStream(output).use { outputStream ->
-                    input.copyTo(outputStream)
+        val partial = File("${output.path}.part")
+        try {
+            client.newCall(Request.Builder().url(url).build()).execute().use { response ->
+                check(response.isSuccessful) { "Downloading error: ${response.code}" }
+                val body = checkNotNull(response.body) { "Empty HTTP response" }
+                body.byteStream().use { input -> partial.outputStream().use { input.copyTo(it) } }
+            }
+            move(partial, output)
+        } finally {
+            partial.delete()
+        }
+    }
+
+    suspend fun fetchModule(url: String): ModuleData? = withContext(Dispatchers.IO) {
+        val normalized = normalizeUrl(url)
+        val cache = cacheFile(normalized)
+        try {
+            val text = if (cache.isFile) cache.readText() else {
+                val request = Request.Builder().url(normalized).header("User-Agent", "batchModulesDownload/0.9").build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        println("Error downloading module.json: ${response.code} for $normalized")
+                        return@withContext null
+                    }
+                    val body = response.body.string().trim()
+                    val contentType = response.header("Content-Type").orEmpty()
+                    if (!contentType.contains("json", ignoreCase = true) && !body.startsWith("{")) {
+                        println("⚠️ $normalized did not return module.json (Content-Type=$contentType)")
+                        return@withContext null
+                    }
+                    body
                 }
             }
-        }
-    }
-
-    /**
-     * Fetches and parses a remote `module.json` file into [ModuleData].
-     *
-     * - Uses a local cache when available to reduce redundant HTTP requests.
-     * - Supports automatic URL normalization for Dropbox, GitHub, and Gist.
-     *
-     * @param url Remote URL to the module manifest.
-     * @return Parsed [ModuleData] instance, or `null` if the request failed or the data was invalid.
-     */
-    suspend fun fetchModule(url: String): ModuleData? = withContext(Dispatchers.IO) {
-        val cache = cacheFile(url)
-        File(cacheDir, "invalid").apply { mkdirs() }
-
-        val text = if (cache.exists()) cache.readText() else {
-            val request = Request.Builder()
-                .url(url)
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Windows NT 5.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2224.3 Safari/537.36"
-                )
-                .build()
-
-            val response = client.newCall(request).execute()
-            if (!response.isSuccessful) {
-                println("Error downloading module.json: ${response.code} for $url")
-                return@withContext null
+            val module = gson.fromJson(text, ModuleData::class.java) ?: return@withContext null
+            if (!cache.exists()) {
+                Files.createDirectories(cacheDir.toPath())
+                val partial = File.createTempFile("manifest-", ".part", cacheDir)
+                try {
+                    partial.writeText(text)
+                    move(partial, cache)
+                } finally {
+                    partial.delete()
+                }
             }
-
-            val contentType = response.header("Content-Type") ?: ""
-            val body = response.body?.string()?.trim().orEmpty()
-
-            if (!contentType.contains("json", ignoreCase = true) && !body.startsWith("{")) {
-                println("⚠️ $url did not return module.json (Content-Type=$contentType)")
-                return@withContext null
-            }
-
-            cache.writeText(body)
-            body
-        }
-
-        try {
-            gson.fromJson(text, ModuleData::class.java)
-        } catch (e: JsonSyntaxException) {
-            println("⚠️ Error parsing $url: ${e.message}.")
+            module
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            println("⚠️ Error fetching $normalized: ${e.message}")
             null
         }
     }
 
-    /**
-     * Downloads all modules provided in the given list of URLs.
-     *
-     * - Each URL is normalized and fetched concurrently.
-     * - Archives are downloaded into current directory.
-     * - Successfully processed caches are cleared after unpacking.
-     * - Failed modules are logged for later review.
-     *
-     * @param urls List of remote `module.json` URLs.
-     */
-    suspend fun downloadAll(urls: List<String>) = coroutineScope {
-        val failedModules = mutableListOf<String>()
+    private fun validId(id: String): Boolean = id.isNotBlank() && id != "." && id != ".." &&
+            id.none { it in "\\/:*?\"<>|" || it.isISOControl() } && !id.endsWith('.') && !id.endsWith(' ')
 
-        urls.map { url ->
-            async {
-                val module = fetchModule(normalizeUrl(url)) ?: return@async
+    suspend fun downloadAll(urls: List<String>, outputDirectory: File = File(".")) {
+        val claimedIds = ConcurrentHashMap.newKeySet<String>()
+        val failures = parallelMap(urls.map(::normalizeUrl).distinct(), DOWNLOAD_WORKERS) { url ->
+            var failedId = url
+            try {
+                val module = fetchModule(url) ?: return@parallelMap url
                 val id = module.id ?: module.name ?: run {
                     println("Pass: no `id` and `name` for $url")
-                    return@async
+                    return@parallelMap null
                 }
-
-                val archiveUrl = normalizeUrl(module.download ?: run {
+                failedId = id
+                check(validId(id)) { "Invalid module id: $id" }
+                val archiveUrl = module.download ?: run {
                     println("Pass: no `download` for $id")
-                    return@async
-                })
-
-                val archiveFile = File(downloadDir, "$id.zip")
-                val outputDir = File(downloadDir, id)
-                val cacheFile = cacheFile(url)
-
-                if (outputDir.exists() && outputDir.isDirectory && outputDir.list()?.isNotEmpty() == true) {
+                    return@parallelMap null
+                }
+                // Different manifests may refer to the same output directory.
+                if (!claimedIds.add(id.lowercase())) return@parallelMap null
+                val outputDir = File(outputDirectory, id)
+                if (outputDir.isDirectory && outputDir.list()?.isNotEmpty() == true) {
                     println("⏩ Pass: $id has already been unpacked")
-                    cacheFile.delete()
-                    return@async
-                }
-
-                try {
-                    if (!archiveFile.exists()) {
-                        println("⬇️ Downloading archive: $archiveUrl → ${archiveFile.name}")
-                        downloadFile(normalizeUrl(archiveUrl), archiveFile)
-                    } else {
-                        println("✅ Archive already downloaded: ${archiveFile.name}")
-                    }
-
-                    cacheFile.delete()
-                    println("✔️ Completed: $id (cache cleared)")
-                } catch (e: Exception) {
-                    println("❌ Error during processing $id: ${e.message}")
-                    failedModules += id
-                }
-            }
-        }.awaitAll()
-
-        cleanup()
-
-        if (failedModules.isNotEmpty()) {
-            println("⚠️ Unable to process modules: ${failedModules.joinToString(", ")}")
-        } else {
-            println("🎉 All modules have been successfully processed.")
-        }
-    }
-
-    /**
-     * Extracts a ZIP archive into a target directory.
-     *
-     * @param zipFile The archive file to extract.
-     * @param destDir The destination directory.
-     */
-    private fun unzip(zipFile: File, destDir: File) {
-        ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
-            var entry = zis.nextEntry
-            while (entry != null) {
-                val outFile = File(destDir, entry.name)
-                if (entry.isDirectory) {
-                    outFile.mkdirs()
                 } else {
-                    outFile.parentFile?.mkdirs()
-                    try {
-                        FileOutputStream(outFile).use { fos ->
-                            zis.copyTo(fos)
-                        }
-                    } catch (e: Exception) {
-                        println("⚠️ Error writing ${outFile.path}: ${e.message}")
+                    val archive = File(downloadDir, "$id.zip")
+                    if (archive.isFile) {
+                        println("✅ Archive already downloaded: ${archive.name}")
+                    } else {
+                        println("⬇️ Downloading archive: $archiveUrl → ${archive.name}")
+                        downloadFile(normalizeUrl(archiveUrl), archive)
                     }
+                    println("✔️ Completed: $id (cache cleared)")
                 }
-                zis.closeEntry()
-                entry = zis.nextEntry
+                cacheFile(url).delete()
+                null
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                println("❌ Error during processing $failedId: ${e.message}")
+                failedId
+            }
+        }.filterNotNull()
+        if (cacheDir.exists()) check(cacheDir.deleteRecursively()) { "Cannot clean cache directory" }
+        if (failures.isEmpty()) println("🎉 All modules have been successfully processed.")
+        else println("⚠️ Unable to process modules: ${failures.joinToString(", ")}")
+    }
+
+    private fun unzip(archive: File, destination: File) {
+        val root = destination.canonicalFile.toPath()
+        ZipFile(archive).use { zip ->
+            for (entry in zip.entries()) {
+                val output = File(destination, entry.name.replace('\\', '/')).canonicalFile
+                check(output.toPath().startsWith(root) && output.toPath() != root) {
+                    "ZIP entry escapes destination: ${entry.name}"
+                }
+                if (entry.isDirectory) {
+                    check(output.isDirectory || output.mkdirs()) { "Cannot create $output" }
+                } else {
+                    check(output.parentFile.isDirectory || output.parentFile.mkdirs()) { "Cannot create ${output.parent}" }
+                    val crc = CRC32()
+                    var size = 0L
+                    zip.getInputStream(entry).use { input ->
+                        output.outputStream().use { target ->
+                            val buffer = ByteArray(8192)
+                            while (true) {
+                                val count = input.read(buffer)
+                                if (count < 0) break
+                                target.write(buffer, 0, count)
+                                crc.update(buffer, 0, count)
+                                size += count
+                            }
+                        }
+                    }
+                    check(size == entry.size && crc.value == entry.crc) { "Corrupt ZIP entry: ${entry.name}" }
+                }
             }
         }
     }
 
-    /**
-     * Unpacks all `.zip` archives in the directory.
-     *
-     * - Each archive is extracted to its own folder.
-     * - Extraction is performed concurrently but limited by a [Semaphore].
-     * - Successfully unpacked archives are deleted afterward.
-     *
-     * @see downloadAll
-     */
-    suspend fun unpackAll() = coroutineScope {
-        val archives: List<File> = downloadDir
-            .listFiles { f -> f.extension == "zip" }
-            ?.toList()
-            .orEmpty()
+    private fun replaceDirectory(temporary: File, destination: File) {
+        val backup = File("${temporary.path}.backup")
+        if (destination.exists()) move(destination, backup)
+        try {
+            move(temporary, destination)
+        } catch (e: Exception) {
+            if (backup.exists()) move(backup, destination)
+            throw e
+        }
+        if (backup.exists()) check(backup.deleteRecursively()) { "Cannot remove backup: $backup" }
+    }
 
+    suspend fun unpackAll(outputDirectory: File = File(".")) {
+        val archives = downloadDir.listFiles { file -> file.isFile && file.extension.equals("zip", ignoreCase = true) }
+            ?.sortedBy { it.name }.orEmpty()
         if (archives.isEmpty()) {
             println("🎉 No archives to unpack")
-            return@coroutineScope
+            return
         }
-
+        withContext(Dispatchers.IO) {
+            Files.createDirectories(outputDirectory.toPath())
+        }
         println("📦 Starting to unpack ${archives.size} archives...")
-
-        val unzipSemaphore = Semaphore(5)
-        val results: List<File?> = archives.mapIndexed { idx, archive ->
-            async(Dispatchers.IO) {
-                unzipSemaphore.withPermit {
-                    val id = archive.nameWithoutExtension
-                    val tempDir = File(downloadDir, "${id}_tmp")
-                    val finalDir = File(downloadDir, id)
-
-                    runCatching {
-                        if (tempDir.exists()) tempDir.deleteRecursively()
-                        unzip(archive, tempDir)
-
-                        val fileCount = tempDir.walk().count { it.isFile }
-                        if (fileCount == 0) error("Archive is empty or has not been unpacked.")
-
-                        if (finalDir.exists()) finalDir.deleteRecursively()
-                        tempDir.renameTo(finalDir)
-
-                        println("✔️ [${idx + 1}/${archives.size}] $id unpacked ($fileCount files)")
-                        archive // <- Явно возвращаем File
-                    }.onFailure {
-                        println("❌ Error during unpacking ${archive.name}: ${it.message}")
-                    }.getOrNull()
-                }
+        val successful = parallelMap(archives.withIndex().toList(), UNPACK_WORKERS) { (index, archive) ->
+            // A unique staging directory cannot collide with another module's id.
+            val temporary =
+                Files.createTempDirectory(outputDirectory.toPath(), ".${archive.nameWithoutExtension}.unpack-").toFile()
+            try {
+                unzip(archive, temporary)
+                val count = temporary.walk().count { it.isFile }
+                check(count > 0) { "Archive is empty or has not been unpacked." }
+                replaceDirectory(temporary, File(outputDirectory, archive.nameWithoutExtension))
+                check(archive.delete()) { "Cannot delete ${archive.name}" }
+                println("✔️ [${index + 1}/${archives.size}] ${archive.nameWithoutExtension} unpacked ($count files)")
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                println("❌ Error during unpacking ${archive.name}: ${e.message}")
+                false
+            } finally {
+                if (temporary.exists()) temporary.deleteRecursively()
             }
-        }.awaitAll()
-
-        val successfullyUnpacked = results.filterNotNull()
-
-        if (successfullyUnpacked.isNotEmpty()) {
-            println("🧹 Deleting ${successfullyUnpacked.size} successfully unpacked archives...")
-            successfullyUnpacked.forEach { zip: File ->
-                try {
-                    if (zip.exists()) {
-                        val deleted = zip.delete()
-                        if (!deleted) println("⚠️ Unable to delete ${zip.name}")
-                    }
-                } catch (e: Exception) {
-                    println("⚠️ Error deleting ${zip.name}: ${e.message}")
-                }
-            }
-        }
-
-        println("🎯 Unpacking complete. Total processed: ${archives.size}, successfully: ${successfullyUnpacked.size}")
-    }
-
-    /**
-     * Cleans up temporary cache data after successful downloads.
-     *
-     * Removes the entire ***cache** directory to ensure fresh state for the next run.
-     */
-    private fun cleanup() {
-        if (cacheDir.exists()) cacheDir.deleteRecursively()
+        }.count { it }
+        println("🎯 Unpacking complete. Total processed: ${archives.size}, successfully: $successful")
     }
 }

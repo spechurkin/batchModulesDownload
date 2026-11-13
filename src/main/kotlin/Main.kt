@@ -1,6 +1,8 @@
 package proj.dnd
 
 import kotlinx.coroutines.coroutineScope
+import java.io.File
+import kotlin.system.exitProcess
 import proj.dnd.ModuleManager.downloadAll
 import proj.dnd.ModuleManager.loadUrlsFromFile
 import proj.dnd.ModuleManager.unpackAll
@@ -30,10 +32,41 @@ import proj.dnd.ModuleManager.unpackAll
  * https://www.dropbox.com/scl/fi/whatever/module.json?rlkey=somekey&dl=1
  * ```
  *
- * @param args Optional CLI argument specifying the path to the links file.
+ * @param args Optional links file and `--dir` / `-d` extraction directory.
  */
 suspend fun main(args: Array<String>) = coroutineScope {
-    val urlsFile = if (args.isNotEmpty()) args[0] else "modules.txt"
+    var urlsFile = "modules.txt"
+    var linksProvided = false
+    var outputDir = File(".")
+    var options = true
+    var index = 0
+    fun usageError(message: String): Nothing {
+        System.err.println("$message\nUsage: java -jar batchModulesDownload.jar [modules.txt] [--dir|-d DIRECTORY]")
+        exitProcess(2)
+    }
+    while (index < args.size) {
+        val arg = args[index++]
+        when {
+            options && arg == "--" -> options = false
+            options && (arg == "--dir" || arg == "-d") -> {
+                if (index == args.size || args[index].isEmpty() || args[index].startsWith("-")) {
+                    usageError("Missing directory for $arg")
+                }
+                outputDir = File(args[index++])
+            }
+            options && arg.startsWith("--dir=") -> {
+                val path = arg.substringAfter('=')
+                if (path.isEmpty()) usageError("Missing directory for --dir")
+                outputDir = File(path)
+            }
+            options && arg.startsWith("-") -> usageError("Unknown option: $arg")
+            linksProvided -> usageError("Unexpected argument: $arg")
+            else -> {
+                urlsFile = arg
+                linksProvided = true
+            }
+        }
+    }
 
     val urls = loadUrlsFromFile(urlsFile)
     if (urls.isEmpty()) {
@@ -43,6 +76,9 @@ suspend fun main(args: Array<String>) = coroutineScope {
 
     println("🔗 ${urls.size} links downloaded from $urlsFile")
 
-    downloadAll(urls)
-    unpackAll()
+    if (!outputDir.isDirectory && !outputDir.mkdirs()) {
+        usageError("Cannot create extraction directory: ${outputDir.absolutePath}")
+    }
+    downloadAll(urls, outputDir)
+    unpackAll(outputDir)
 }
