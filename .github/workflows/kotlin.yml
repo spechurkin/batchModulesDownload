@@ -1,0 +1,116 @@
+name: Kotlin build and release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kotlin-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build executable JAR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          version = ET.parse('pom.xml').getroot().findtext('{http://maven.apache.org/POM/4.0.0}version')
+          tag = os.environ['GITHUB_REF_NAME']
+          if not version or version.endswith('-SNAPSHOT') or tag != f'v{version}':
+              raise SystemExit(f'Release tag {tag!r} must match a non-SNAPSHOT POM version: v{version}')
+          PY
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Build and test
+        run: mvn --batch-mode --no-transfer-progress clean verify
+
+      - name: Check executable JAR
+        run: |
+          jar="$GITHUB_WORKSPACE/target/batchModulesDownload.jar"
+          mkdir -p "$RUNNER_TEMP/kotlin-smoke"
+          cd "$RUNNER_TEMP/kotlin-smoke"
+          : > modules.txt
+          java -jar "$jar" modules.txt | tee output.txt
+          grep -F 'Empty links file! Add them to modules.txt' output.txt
+
+      - name: Create checksum
+        working-directory: target
+        run: sha256sum batchModulesDownload.jar > batchModulesDownload.jar.sha256
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: kotlin-package
+          path: |
+            target/batchModulesDownload.jar
+            target/batchModulesDownload.jar.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kotlin-tests
+          path: target/surefire-reports/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    name: Publish GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Download tested package
+        uses: actions/download-artifact@v8
+        with:
+          name: kotlin-package
+          path: dist
+
+      - name: Verify checksum
+        working-directory: dist
+        run: sha256sum --check batchModulesDownload.jar.sha256
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          options=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" \
+            dist/batchModulesDownload.jar \
+            dist/batchModulesDownload.jar.sha256 \
+            --verify-tag --generate-notes --title "$RELEASE_TAG" "${options[@]}"

@@ -14,7 +14,7 @@ operations, and Gson is used for JSON parsing.
 - Caches downloaded JSON files to avoid redundant network calls.
 - Concurrent downloading and unpacking with a limit on simultaneous operations.
 
-Both implementations use five download workers, followed by five extraction
+The implementation uses five download workers, followed by five extraction
 workers. Repeated URLs and module IDs are processed once per run. Each worker
 takes the next queued job as soon as it finishes its current job.
 
@@ -36,12 +36,53 @@ java -jar batchModulesDownload.jar modules.txt --dir "path/to/modules"
 java -jar batchModulesDownload.jar -d "path/to/modules"
 ```
 
-Both versions accept `--dir DIRECTORY`, `-d DIRECTORY`, or `--dir=DIRECTORY`,
+The CLI accepts `--dir DIRECTORY`, `-d DIRECTORY`, or `--dir=DIRECTORY`,
 before or after the optional links file. The extraction directory is created if
 needed; relative paths are resolved from the current working directory. Each
 archive is unpacked into `<directory>/<module-id>`. Already populated module
 directories there are skipped on subsequent runs. Quote paths containing spaces.
 Without this option, extraction uses the current working directory.
+
+## Kotlin build and release
+
+Build the executable JAR, including its dependencies, with JDK 17 or newer and Maven:
+
+```sh
+mvn --batch-mode --no-transfer-progress clean verify
+java -jar target/batchModulesDownload.jar modules.txt --dir "path/to/modules"
+```
+
+The [Kotlin workflow](.github/workflows/kotlin.yml) builds and tests once on Linux
+for branch pushes and pull requests. The executable JAR is the same for Windows,
+Linux, and macOS with a compatible JVM. The workflow also checks that the packaged
+JAR starts, then saves the JAR, its SHA-256 checksum, and test reports as workflow
+artifacts for 14 days. A build can also be started manually from the Actions tab.
+
+To publish a release, set the project version in `pom.xml`, commit the changes,
+and push a matching tag. For the current `1.0.0` version:
+
+```sh
+git tag -a v1.0.0 -m "release 1.0.0"
+git push origin v1.0.0
+```
+
+After the build and tests pass, the workflow publishes a GitHub Release with
+`batchModulesDownload.jar`, `batchModulesDownload.jar.sha256`, and generated
+release notes. It publishes the tested platform-independent JAR without rebuilding it.
+Tags must match `v` followed by the POM version; SNAPSHOT versions are rejected.
+Versions containing a hyphen, such as `1.1.0-rc.1`, are marked as prereleases.
+An existing release is not overwritten. Rerunning a published release's job fails;
+publish a new version and tag for a replacement.
+
+Publishing uses the built-in `GITHUB_TOKEN` with `contents: write` scoped to the
+release job. No additional secret is needed. Manual and branch builds only
+produce workflow artifacts.
+
+To verify a downloaded package on Linux or with Git Bash:
+
+```sh
+sha256sum --check batchModulesDownload.jar.sha256
+```
 
 ## Kotlin tests
 
@@ -57,50 +98,8 @@ with temporary working directories, so downloads and caches stay out of the proj
 
 ## Perl version
 
-The Perl implementation is located beside the Kotlin files in `src/main/kotlin`:
-`Main.pl`, `ModuleData.pm`, and `ModuleManager.pm`.
-
-Use a Perl build with thread support (for example, Strawberry Perl on Windows).
-Install the HTTP, HTTPS, JSON, and ZIP dependencies if they are not already available:
-
-```sh
-cpan LWP::UserAgent LWP::Protocol::https JSON::PP IO::Uncompress::Unzip
-```
-
-Run from the directory where modules should be downloaded and unpacked:
-
-```sh
-perl src/main/kotlin/Main.pl modules.txt
-perl src/main/kotlin/Main.pl modules.txt --dir "path/to/modules"
-perl src/main/kotlin/Main.pl -d "path/to/modules"
-```
-
-The links file defaults to `modules.txt` when the argument is omitted. Downloads
-and the manifest cache use the current working directory. `--dir` / `-d` changes
-only the extraction destination, just as in the Kotlin version.
-
-The integration tests use a local HTTP server and temporary directories:
-
-```sh
-cpan HTTP::Daemon IO::Compress::Zip
-perl src/test/perl/module_manager.t
-```
-
-## Real modules integration test
-
-This opt-in test downloads the actual archives referenced by `modules.txt` using
-both CLIs. It checks source manifests and any manifests included in the archives,
-compares every file by path and SHA-256, checks that archives and staging files
-are removed, and runs both CLIs
-again to verify already unpacked modules are skipped.
-
-Build the JAR first, then run with Python 3.11 or newer, Java and Perl on `PATH`:
-
-```sh
-mvn package
-python src/test/integration/real_modules.py
-```
-
-Use `--java`, `--perl`, `--jar` or `--modules` to override executable and input
-paths. Each invocation creates separate Kotlin and Perl working directories,
-logs and `result.json` under `target/real-modules/`.
+The standalone Perl implementation is maintained on the
+[`experimental/perl` branch](https://github.com/spechurkin/batchModulesDownload/tree/experimental/perl).
+It builds a standalone CLI executable with Perl and dependencies bundled.
+The default `modules.txt` and extraction directory are beside the executable;
+`--modules` / `-m` and `--dir` / `-d` override those paths.
