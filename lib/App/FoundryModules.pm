@@ -5,7 +5,10 @@ use strict;
 use warnings;
 use utf8;
 use Config;
+use Cwd qw(getcwd);
+use File::Basename qw(dirname);
 use File::Path qw(make_path);
+use File::Spec;
 use Getopt::Long ();
 use App::FoundryModules::Downloader;
 
@@ -15,21 +18,22 @@ sub usage {
     return <<'USAGE';
 Usage: foundry-modules [options] [modules.txt]
 
-  -d, --dir DIRECTORY  Extract modules into DIRECTORY (default: current directory)
+  -m, --modules FILE   Read module URLs from FILE (also accepted as a positional argument)
+  -d, --dir DIRECTORY  Extract modules into DIRECTORY (default: executable directory)
   -h, --help           Show this help
       --version        Show version
 
-The links file defaults to modules.txt. Downloads and cache use the working directory.
+By default, modules.txt, downloads and extracted modules are beside the executable.
 USAGE
 }
 
 sub run {
     my ($class, @args) = @_;
-    my ($help, $version);
-    my $directory = '.';
+    my ($help, $version, $directory, $links_option);
     my $parser = Getopt::Long::Parser->new(config => [qw(no_auto_abbrev no_ignore_case permute)]);
     unless ($parser->getoptionsfromarray(\@args,
         'dir|d=s' => \$directory,
+        'modules|m=s' => \$links_option,
         'help|h' => \$help,
         'version' => \$version,
     )) {
@@ -44,7 +48,9 @@ sub run {
         print "foundry-modules $VERSION\n";
         return 0;
     }
-    if (@args > 1 || !length $directory) {
+    if (@args > 1 || (defined $links_option && @args)
+        || (defined $links_option && !length $links_option)
+        || (defined $directory && !length $directory)) {
         print STDERR usage();
         return 2;
     }
@@ -53,7 +59,12 @@ sub run {
         return 2;
     }
 
-    my $links_file = @args ? $args[0] : 'modules.txt';
+    my $working_directory = getcwd();
+    my $application_directory = $ENV{PAR_PROGNAME}
+        ? dirname(File::Spec->rel2abs($ENV{PAR_PROGNAME})) : $working_directory;
+    my $links_file = $links_option // (@args ? $args[0] : File::Spec->catfile($application_directory, 'modules.txt'));
+    $links_file = File::Spec->rel2abs($links_file, $working_directory);
+    $directory = defined $directory ? File::Spec->rel2abs($directory, $working_directory) : $application_directory;
     my $urls = App::FoundryModules::Downloader::load_urls_from_file($links_file);
     unless (@$urls) {
         print "❌ Empty links file! Add them to $links_file\n";
@@ -65,6 +76,7 @@ sub run {
     }
 
     print '🔗 ' . scalar(@$urls) . " links downloaded from $links_file\n";
+    chdir $application_directory or die "Cannot enter application directory: $!\n";
     App::FoundryModules::Downloader::download_all($urls, $directory);
     App::FoundryModules::Downloader::unpack_all($directory);
     return 0;

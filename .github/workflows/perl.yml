@@ -1,0 +1,52 @@
+name: build cli
+
+on:
+  push:
+    branches: [experimental/perl]
+    tags: ['perl-v*']
+  pull_request:
+    branches: [experimental/perl]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            artifact: foundry-modules-windows-x64
+            executable: foundry-modules.exe
+          - os: ubuntu-22.04
+            artifact: foundry-modules-linux-x64
+            executable: foundry-modules
+          - os: macos-15-intel
+            artifact: foundry-modules-macos-x64
+            executable: foundry-modules
+          - os: macos-15
+            artifact: foundry-modules-macos-arm64
+            executable: foundry-modules
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shogo82148/actions-setup-perl@v1
+        with:
+          perl-version: '5.42.3'
+          distribution: strawberry
+          multi-thread: true
+          install-modules-with: cpanm
+          install-modules-args: --with-develop
+      - name: Test source
+        run: prove -lr t
+      - name: Build standalone CLI
+        run: perl script/build.pl
+      - name: Test isolated executable
+        run: perl script/test-binary.pl dist/${{ matrix.executable }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+          if-no-files-found: error

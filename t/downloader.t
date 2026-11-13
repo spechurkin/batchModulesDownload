@@ -7,6 +7,7 @@ use Cwd qw(getcwd);
 use FindBin;
 use lib "$FindBin::Bin/../lib";
 use File::Path qw(make_path);
+use File::Copy qw(copy);
 use File::Spec;
 use File::Temp qw(tempdir);
 use HTTP::Daemon;
@@ -89,10 +90,10 @@ sub read_file {
     return <$input>;
 }
 
-sub run_perl {
-    my (@args) = @_;
+sub run_command {
+    my (@command) = @_;
     my $errors = gensym;
-    my $pid = open3(my $input, my $output, $errors, $^X, @args);
+    my $pid = open3(my $input, my $output, $errors, @command);
     close $input;
     local $/;
     my $stdout = <$output> // '';
@@ -101,7 +102,25 @@ sub run_perl {
     return ($? >> 8, $stdout, $stderr);
 }
 
+sub run_perl {
+    return run_command($^X, @_);
+}
+
+sub run_executable {
+    my ($binary, @args) = @_;
+    local %ENV = %ENV;
+    delete @ENV{qw(PERL5LIB PERLLIB PERL5OPT)};
+    $ENV{PATH} = $^O eq 'MSWin32' ? "$ENV{SystemRoot}/System32;$ENV{SystemRoot}" : '/usr/bin:/bin';
+    return run_command($binary, @args);
+}
+
 sub run_main {
+    if ($ENV{FOUNDRY_MODULES_EXE}) {
+        my $local_binary = File::Spec->rel2abs('foundry-modules' . ($^O eq 'MSWin32' ? '.exe' : ''));
+        copy($ENV{FOUNDRY_MODULES_EXE}, $local_binary) or die "Cannot stage executable: $!";
+        chmod 0755, $local_binary or die "Cannot set executable permissions: $!";
+        return run_executable($local_binary, @_);
+    }
     return run_perl($main, @_);
 }
 
@@ -156,7 +175,7 @@ subtest 'CLI download and unpack pipeline' => sub {
         write_file('modules.txt', "${base}module.json\n${base}fallback.json\n");
         my ($status, $out, $err) = run_main();
         is($status, 0, 'default modules.txt run succeeds') or diag $err;
-        like($out, qr/2 links downloaded from modules.txt/, 'link count');
+        like($out, qr/2 links downloaded from .*modules.txt/, 'link count');
         is(read_file('sample/nested/module.json'), '{"id":"inside"}', 'nested entry extracted');
         is(read_file('sample/payload.bin'), "\x00\xff\r\n", 'binary bytes preserved');
         ok(-f 'fallback/payload.bin', 'name used when ID absent');
@@ -172,6 +191,37 @@ subtest 'CLI download and unpack pipeline' => sub {
         like($out, qr/sample has already been unpacked/, 'skip populated directory');
         is($hits{'/module.zip'}, $downloads, 'skip archive request on repeat');
         like($out, qr/No archives to unpack/, 'nothing to unpack');
+    });
+};
+
+subtest 'portable defaults and explicit paths from a different working directory' => sub {
+    plan skip_all => 'Run script/test-binary.pl to test portable executable defaults'
+        unless $ENV{FOUNDRY_MODULES_EXE};
+    in_directory('portable-launch', sub {
+        make_path('application');
+        my $binary = File::Spec->rel2abs('application/foundry-modules' . ($^O eq 'MSWin32' ? '.exe' : ''));
+        copy($ENV{FOUNDRY_MODULES_EXE}, $binary) or die "Cannot stage executable: $!";
+        chmod 0755, $binary or die "Cannot set executable permissions: $!";
+        write_file('application/modules.txt', "${base}module.json\n");
+        write_file('modules.txt', "${base}failed.json\n");
+
+        my ($status, $out, $err) = run_executable($binary);
+
+        is($status, 0, 'no-argument launch succeeds from another directory') or diag $out, $err;
+        ok(-f 'application/sample/payload.bin', 'default destination is beside executable');
+        ok(!-e 'sample', 'working directory does not receive default extraction');
+        unlike($out, qr/Unable to process modules/, 'read modules.txt beside executable');
+        is($err, '', 'standalone launch has no warnings');
+
+        write_file('custom list.txt', "${base}fallback.json\n");
+        for my $option ('--modules', '-m', 'positional') {
+            my @input = $option eq 'positional' ? ('custom list.txt') : ($option, 'custom list.txt');
+            my $output = "custom output $option";
+            ($status, $out, $err) = run_executable($binary, @input, '-d', $output);
+            is($status, 0, "$option input override succeeds") or diag $out, $err;
+            ok(-f "$output/fallback/payload.bin", 'relative output is resolved from terminal directory');
+            is($err, '', 'override run has no warnings');
+        }
     });
 };
 
@@ -279,12 +329,12 @@ subtest 'missing and empty link files stop before unpacking' => sub {
         my ($status, $out, $err) = run_main('missing.txt');
         is($status, 0, 'missing file exits normally');
         like($out, qr/File not found:.*missing.txt/, 'missing file warning');
-        like($out, qr/Empty links file! Add them to missing.txt/, 'empty links warning');
+        like($out, qr/Empty links file! Add them to .*missing.txt/, 'empty links warning');
         ok(-f 'orphan.zip' && !-d 'orphan', 'no unpack for empty URL list');
         write_file('modules.txt', "# comment\n \n");
         ($status, $out, $err) = run_main();
         is($status, 0, 'comment-only file exits normally');
-        like($out, qr/Empty links file! Add them to modules.txt/, 'default empty links message');
+        like($out, qr/Empty links file! Add them to .*modules.txt/, 'default empty links message');
     });
 };
 

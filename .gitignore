@@ -9,3 +9,5 @@
 /.prove
 /.idea/
 /target/
+/dist/
+/local/
